@@ -388,5 +388,5 @@ new Promise(resolve => resolve('123'))
 
    上面代码中，`Promise.reject`方法的参数是一个`thenable`对象，执行以后，后面`catch`方法的参数不是`reject`抛出的“出错了”这个字符串，而是`thenable`对象。
 
-   ​
+   
 
