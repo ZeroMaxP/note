@@ -2,7 +2,7 @@
 
 UE4的导航使用的是[RecastDetour](https://github.com/recastnavigation/recastnavigation)组件，这是一个开源组件，主要支持3D场景的导航网格导出和寻路，或者有一个更流行的名字叫做NavMesh。不管是Unity还是UE都使用了这一套组件。不过UE4对其算法做了不小的修改。
 
-简单地来说，寻路分为`体素化`和`利用导航网格寻路`两部分
+简单地来说，寻路分为`建立NavMesh数据`和`利用导航网格寻路`两部分
 
 ## 体素化相关概念
 
@@ -31,7 +31,7 @@ zmin≤z≤zmax
 
 ### 区间（span）
 
-代表某一方向上连续的格子。
+一列（xz平面投影相同）连续的体素盒子，smin和smax表示连续体素的最低y坐标和最高y坐标（底面和顶面），next指针实现了一个链表，方便管理投影相同的所有区间（区间与区域之前不连续），xz的坐标记录在高度场中，结构体本身没有记。
 
 ![img](Spline.assets/1620.jpeg)
 
@@ -44,13 +44,6 @@ struct rcSpanData
 	unsigned int smin : RC_SPAN_HEIGHT_BITS;	///< The lower limit of the span. [Limit: < #smax]
 	unsigned int smax : RC_SPAN_HEIGHT_BITS;	///< The upper limit of the span. [Limit: <= #RC_SPAN_MAX_HEIGHT]
 	unsigned int area : 6;			///< The area id assigned to the span.
-};
-
-struct rcSpanCache
-{
-	unsigned short x;
-	unsigned short y;
-	rcSpanData data;
 };
 
 /// Represents a span in a heightfield.
@@ -95,11 +88,15 @@ struct rcHeightfield
 
 ### 紧缩空间
 
-高度场中的span是三角面的体素集，是“实心”的部分
- 紧缩空间是将实心区域之间的“空心”部分取出来
- y是起始高度，也是“实心”空间的可行走的上表面
- h是空心的连续高度
- con用一个uint来表示与4个邻居的联通情况（二进制位压缩表示）
+-   高度场中的span是三角面的体素集，是“实心”的部分
+
+-   紧缩空间是将实心区域之间的“空心”部分取出来
+
+-   y是起始高度，也是“实心”空间的可行走的上表面
+
+-   h是空心的连续高度
+
+-   con用一个uint来表示与4个邻居的联通情况（二进制位压缩表示）
 
 ```c++
 /// Represents a span of unobstructed space within a compact heightfield.
@@ -166,7 +163,187 @@ struct rcCompactHeightfield
 
 将整个场景转换为一个个格子内的体素，并标记每个span的可行走状态。以方便后续做区域划分和寻路。
 
-### ue4中的体素化流程
+## ue4中的建立NaviMesh的过程
+
+### 1.初始化参数(在Nav组件初始化创建时)
+
+逻辑在`ConfigureBuildProperties(FRecastBuildConfig& OutConfig)`中
+
+几个重要参数如下：
+
+-   cs：xz平面下体素的大小。
+-   ch：y轴下体素的高度。
+-   walkableSlopeAngle：可行走倾斜角度。
+-   walkableHeight：寻路agent的高度。
+-   walkableClimb：寻路agent的爬坡高度。
+-   walkableRadius：寻路agent的半径。
+
+```c++
+/// Specifies a configuration to use when performing Recast builds.
+/// @ingroup recast
+struct rcConfig
+{
+	/// The width of the field along the x-axis. [Limit: >= 0] [Units: vx]
+	int width;
+
+	/// The height of the field along the z-axis. [Limit: >= 0] [Units: vx]
+	int height;
+	
+	/// The width/height size of tile's on the xz-plane. [Limit: >= 0] [Units: vx]
+	int tileSize;
+	
+	/// The size of the non-navigable border around the heightfield. [Limit: >=0] [Units: vx]
+	int borderSize;
+
+	/// The xz-plane cell size to use for fields. [Limit: > 0] [Units: wu] 
+	float cs;
+
+	/// The y-axis cell size to use for fields. [Limit: > 0] [Units: wu]
+	float ch;
+
+	/// The minimum bounds of the field's AABB. [(x, y, z)] [Units: wu]
+	float bmin[3]; 
+
+	/// The maximum bounds of the field's AABB. [(x, y, z)] [Units: wu]
+	float bmax[3];
+
+	/// The maximum slope that is considered walkable. [Limits: 0 <= value < 90] [Units: Degrees] 
+	float walkableSlopeAngle;
+
+	/// Minimum floor to 'ceiling' height that will still allow the floor area to 
+	/// be considered walkable. [Limit: >= 3] [Units: vx] 
+	int walkableHeight;
+	
+	/// Maximum ledge height that is considered to still be traversable. [Limit: >=0] [Units: vx] 
+	int walkableClimb;
+	
+	/// The distance to erode/shrink the walkable area of the heightfield away from 
+	/// obstructions.  [Limit: >=0] [Units: vx] 
+	int walkableRadius;
+	
+	//...
+};
+
+struct FRecastBuildConfig : public rcConfig
+{
+	//...
+
+	FRecastBuildConfig()
+	{
+		Reset();
+	}
+
+	void Reset()
+	{
+		FMemory::Memzero(*this);
+		bPerformVoxelFiltering = true;
+		bGenerateDetailedMesh = true;
+		bGenerateBVTree = true;
+		bMarkLowHeightAreas = false;
+		bUseExtraTopCellWhenMarkingAreas = true;
+		bFilterLowSpanSequences = false;
+		bFilterLowSpanFromTileCache = false;
+		// Still initializing, even though the property is deprecated, to avoid static analysis warnings
+		PolyMaxHeight = 10;
+		MaxPolysPerTile = -1;
+		AgentIndex = 0;
+	}
+};
+```
+
+### 2.体素化
+
+#### 创建体素高度域
+
+逻辑在`FRecastTileGenerator::CreateHeightField`中
+
+```c++
+bool FRecastTileGenerator::CreateHeightField(FNavMeshBuildContext& BuildContext, FTileRasterizationContext& RasterContext)
+{
+	SCOPE_CYCLE_COUNTER(STAT_Navigation_RecastCreateHeightField);
+
+	TileConfig.width = TileConfig.tileSize + TileConfig.borderSize * 2;
+	TileConfig.height = TileConfig.tileSize + TileConfig.borderSize * 2;
+
+	const float BBoxPadding = TileConfig.borderSize * TileConfig.cs;
+	TileConfig.bmin[0] -= BBoxPadding;
+	TileConfig.bmin[2] -= BBoxPadding;
+	TileConfig.bmax[0] += BBoxPadding;
+	TileConfig.bmax[2] += BBoxPadding;
+
+	BuildContext.log(RC_LOG_PROGRESS, "CreateHeightField:");
+	BuildContext.log(RC_LOG_PROGRESS, " - %d x %d cells", TileConfig.width, TileConfig.height);
+
+	const bool bHasGeometry = RawGeometry.Num() > 0;
+
+	// Allocate voxel heightfield where we rasterize our input data to.
+	if (bHasGeometry)
+	{
+		RasterContext.SolidHF = rcAllocHeightfield();
+		if (RasterContext.SolidHF == nullptr)
+		{
+			BuildContext.log(RC_LOG_ERROR, "CreateHeightField: Out of memory 'SolidHF'.");
+			return false;
+		}
+		if (!rcCreateHeightfield(&BuildContext, *RasterContext.SolidHF, TileConfig.width, TileConfig.height, TileConfig.bmin, TileConfig.bmax, TileConfig.cs, TileConfig.ch))
+		{
+			BuildContext.log(RC_LOG_ERROR, "CreateHeightField: Could not create solid heightfield.");
+			return false;
+		}
+	}
+	return true;
+}
+
+bool rcCreateHeightfield(rcContext* /*ctx*/, rcHeightfield& hf, int width, int height,
+						 const float* bmin, const float* bmax,
+						 float cs, float ch)
+{
+	// TODO: VC complains about unref formal variable, figure out a way to handle this better.
+//	rcAssert(ctx);
+	
+	hf.width = width;
+	hf.height = height;
+	rcVcopy(hf.bmin, bmin);
+	rcVcopy(hf.bmax, bmax);
+	hf.cs = cs;
+	hf.ch = ch;
+	hf.spans = (rcSpan**)rcAlloc(sizeof(rcSpan*)*hf.width*hf.height, RC_ALLOC_PERM);
+	if (!hf.spans)
+		return false;
+	memset(hf.spans, 0, sizeof(rcSpan*)*hf.width*hf.height);
+
+#if EPIC_ADDITION_USE_NEW_RECAST_RASTERIZER
+	hf.EdgeHits = (rcEdgeHit*)rcAlloc(sizeof(rcEdgeHit) * (hf.height + 1), RC_ALLOC_PERM); 
+	if (!hf.EdgeHits)
+		return false;
+	memset(hf.EdgeHits, 0, sizeof(rcEdgeHit) * (hf.height + 1));
+
+	hf.RowExt = (rcRowExt*)rcAlloc(sizeof(rcRowExt) * (hf.height + 2), RC_ALLOC_PERM); 
+
+	for (int i = 0; i < hf.height + 2; i++)
+	{
+		hf.RowExt[i].MinCol = hf.width + 2;
+		hf.RowExt[i].MaxCol = -2;
+	}
+
+	hf.tempspans = (rcTempSpan*)rcAlloc(sizeof(rcTempSpan)*(hf.width + 2) * (hf.height + 2), RC_ALLOC_PERM); 
+	if (!hf.tempspans)
+		return false;
+
+	for (int i = 0; i < hf.height + 2; i++)
+	{
+		for (int j = 0; j < hf.width + 2; j++)
+		{
+			hf.tempspans[i * (hf.width + 2) + j].sminmax[0] = 32000;
+			hf.tempspans[i * (hf.width + 2) + j].sminmax[1] = -32000;
+		}
+	}
+
+#endif
+
+	return true;
+}
+```
 
 #### 标记可行走的面
 
@@ -188,7 +365,7 @@ void rcMarkWalkableTrianglesCos(rcContext* /*ctx*/, const float walkableSlopeCos
 		const int* tri = &tris[i*3];
 		calcTriNormal(&verts[tri[0]*3], &verts[tri[1]*3], &verts[tri[2]*3], norm);
 		// Check if the face is walkable.
-		if (norm[1] > walkableSlopeCos)
+		if (norm[1] > walkableSlopeCos) // 如果
 			areas[i] = RC_WALKABLE_AREA;
 	}
 }
@@ -198,16 +375,41 @@ void rcMarkWalkableTrianglesCos(rcContext* /*ctx*/, const float walkableSlopeCos
 static void calcTriNormal(const float* v0, const float* v1, const float* v2, float* norm)
 {
 	float e0[3], e1[3];
-	rcVsub(e0, v1, v0);
+	rcVsub(e0, v1, v0); //e0 = v1 - v0
 	rcVsub(e1, v2, v0);
 	rcVcross(norm, e0, e1);
 	rcVnormalize(norm);
+}
+
+// 另一个版本
+Point calTriNormal( Point ver1, Point ver2, Point ver3 )
+{
+	double temp1[3], temp2[3], normal[3];
+	double length = 0.0;
+	temp1[0] = ver2[0] - ver1[0];
+	temp1[1] = ver2[1] - ver1[1];
+	temp1[2] = ver2[2] - ver1[2];
+	temp2[0] = ver3[0] - ver2[0];
+	temp2[1] = ver3[1] - ver2[1];
+	temp2[2] = ver3[2] - ver2[2];
+	//计算法线
+	normal[0] = temp1[1] * temp2[2] - temp1[2] * temp2[1];
+	normal[1] = -(temp1[0] * temp2[2] - temp1[2] * temp2[0]);
+	normal[2] = temp1[0] * temp2[1] - temp1[1] * temp2[0];
+	//法线单位化
+	length = sqrt(normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]);
+	if (length == 0.0f) { length = 1.0f; }
+	normal[0] /= length;
+	normal[1] /= length;
+	normal[2] /= length;
+	Point e_normal(normal[0], normal[1], normal[2]);
+	return e_normal;
 }
 ```
 
 ##### 补充：
 
-1. norm[1] > walkableSlopeCos 判断原理
+1. norm[1] > walkableSlopeCos [判断原理](https://blog.csdn.net/GatyFly/article/details/123860213)
 
 walkableSlopAngle是面最大可行走倾角
 
@@ -221,7 +423,7 @@ walkableSlopAngle是面最大可行走倾角
 
  可知，![\cos\theta](Spline.assets/theta-165238476293910.gif)就是法向量的y分量，也就是代码中的norm[1]
 
-所以 ![\theta](Spline.assets/theta.gif)< walkableSlopAngle, 此时代表此三角形是可行走的。
+所以 ![\theta](Spline.assets/theta.gif)< walkableSlopAngle (norm[1] > walkableSlopeCos)，此时代表此三角形是可行走的。
 
 2. 叉积计算法线原理
 
@@ -231,11 +433,23 @@ walkableSlopAngle是面最大可行走倾角
 
 这部分逻辑主要在`rcRasterizeTriangles()`函数中。更准确说是在`rasterizeTri()`函数中。
 
-这里使用光栅化这个词，因为Rasterize和渲染管线中的Rasterize是一毛一样的。都是将三角形投影到矩阵（像素或者体素）中。
+这里使用光栅化这个词，因为Rasterize和渲染管线中的Rasterize是一样的。都是将三角形投影到矩阵（像素或者体素）中。
 
 光栅化的目的，就是找出连续的小格子。不管是连续的开放空间还是连续的密闭空间。光栅化时，也是以三角形为基本单位的。![img](Spline.assets/1620.jpeg)
 
 在上图中，(2,2)这个xz平面的格子上，就有三个span。绿色代表开放空间，红色代表密闭空间。
+
+##### 流程图
+
+具体过程是：先计算三角形的AABB包围盒在xz平面下的投影。
+
+![这里写图片描述](Spline.assets/70.jpeg)
+
+然后遍历所有被投影覆盖的高度域格子列(grid column)，每个格子列与三角形相交的部分取最低点和最高点，中间部分就是新增加的区间。新增区间时，若与老的区间有重叠，则还需要合并。最终我们得到一个spans数组，存在rcHeightField中。每个span中有属性area，取值源于前面计算出的m_triareas数组。
+
+![这里写图片描述](Spline.assets/70-16524297230192.jpeg)
+
+![img](Spline.assets/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L2xzY2NzbA==,size_16,color_FFFFFF,t_70-16524305862847.png)
 
 ##### 1.记录xz平面三角形的投影，是一个AABB的包围盒。
 
@@ -481,6 +695,8 @@ void rcFilterLowHangingWalkableObstacles(rcContext* ctx, const int walkableClimb
 
 如果一个span和其邻居之间的高度差过大，超过了walkableClimb，那么认为自己在陡坡上，不可达。另外如果其邻居之间的高度差过大，也认为不可达。对应的函数为`rcFilterLedgeSpans()`
 
+![img](Spline.assets/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L2xzY2NzbA==,size_16,color_FFFFFF,t_70.png)
+
 ```c++
 void rcFilterLedgeSpans(rcContext* ctx, const int walkableHeight, const int walkableClimb, rcHeightfield& solid)
 {
@@ -550,133 +766,349 @@ void rcFilterLedgeSpans(rcContext* ctx, const int walkableHeight, const int walk
 
 ##### span上方有不可行走的障碍
 
-如果某个span可行走，但是其上方有不可行走的障碍物，也认为不可行走。实现函数为`rcFilterWalkableLowHeightSpans()`。源码也非常非常简单。
+如果某个span可行走，但是其上方有不可行走的障碍物，也认为不可行走。实现函数为`rcFilterWalkableLowHeightSpans()`。
+
+![这里写图片描述](Spline.assets/70-16524302577614.jpeg)
 
 ```c++
-for (int y = 0; y < h; ++y)
-{
-	for (int x = 0; x < w; ++x)
-	{
-		for (rcSpan* s = solid.spans[x + y*w]; s; s = s->next)
-		{
-			const int bot = (int)(s->data.smax);
-			const int top = s->next ? (int)(s->next->data.smin) : MAX_HEIGHT;
-			if ((top - bot) <= walkableHeight)
-				s->data.area = RC_NULL_AREA;
-		}
-	}
-}
-```
-
-##### 特殊的边缘规则
-
-壁架（ledge）检测（可以理解为过滤边界），如果从span的顶部向下到轴邻域的步进超过可配置的值，则span将被视为壁架并且不可遍历。可视化如下图，蓝色为ledge。
-
-见函数rcFilterLedgeSpans
-
-![在这里插入图片描述](Spline.assets/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L2FsZXhodTIwMTBx,size_16,color_FFFFFF,t_70.png)
-
-```c++
-/// @par
-///
-/// A ledge is a span with one or more neighbors whose maximum is further away than @p walkableClimb
-/// from the current span's maximum.
-/// This method removes the impact of the overestimation of conservative voxelization 
-/// so the resulting mesh will not have regions hanging in the air over ledges.
-/// 
-/// A span is a ledge if: <tt>rcAbs(currentSpan.smax - neighborSpan.smax) > walkableClimb</tt>
-/// 
-/// @see rcHeightfield, rcConfig
-void rcFilterLedgeSpans(rcContext* ctx, const int walkableHeight, const int walkableClimb,
-						rcHeightfield& solid)
+void rcFilterWalkableLowHeightSpans(rcContext* ctx, int walkableHeight, rcHeightfield& solid)
 {
 	rcAssert(ctx);
 	
-	ctx->startTimer(RC_TIMER_FILTER_BORDER);
-
+	ctx->startTimer(RC_TIMER_FILTER_WALKABLE);
+	
 	const int w = solid.width;
 	const int h = solid.height;
 	const int MAX_HEIGHT = 0xffff;
 	
-	// Mark border spans.
+	// Remove walkable flag from spans which do not have enough
+	// space above them for the agent to stand there.
 	for (int y = 0; y < h; ++y)
 	{
 		for (int x = 0; x < w; ++x)
 		{
 			for (rcSpan* s = solid.spans[x + y*w]; s; s = s->next)
 			{
-				// Skip non walkable spans.
-				if (s->data.area == RC_NULL_AREA)
-					continue;
-				
 				const int bot = (int)(s->data.smax);
 				const int top = s->next ? (int)(s->next->data.smin) : MAX_HEIGHT;
-				
-				// Find neighbours minimum height.
-				int minh = MAX_HEIGHT;
-
-				// Min and max height of accessible neighbours.
-				int asmin = s->data.smax;
-				int asmax = s->data.smax;
-
-				for (int dir = 0; dir < 4; ++dir)
-				{
-					int dx = x + rcGetDirOffsetX(dir);
-					int dy = y + rcGetDirOffsetY(dir);
-					// Skip neighbours which are out of bounds.
-					if (dx < 0 || dy < 0 || dx >= w || dy >= h)
-					{
-						minh = rcMin(minh, -walkableClimb - bot);
-						continue;
-					}
-
-					// From minus infinity to the first span.
-					rcSpan* ns = solid.spans[dx + dy*w];
-					int nbot = -walkableClimb;
-					int ntop = ns ? (int)ns->data.smin : MAX_HEIGHT;
-					// Skip neightbour if the gap between the spans is too small.
-					if (rcMin(top,ntop) - rcMax(bot,nbot) > walkableHeight)
-						minh = rcMin(minh, nbot - bot);
-					
-					// Rest of the spans.
-					for (ns = solid.spans[dx + dy*w]; ns; ns = ns->next)
-					{
-						nbot = (int)ns->data.smax;
-						ntop = ns->next ? (int)ns->next->data.smin : MAX_HEIGHT;
-						// Skip neightbour if the gap between the spans is too small.
-						if (rcMin(top,ntop) - rcMax(bot,nbot) > walkableHeight)
-						{
-							minh = rcMin(minh, nbot - bot);
-						
-							// Find min/max accessible neighbour height. 
-							if (rcAbs(nbot - bot) <= walkableClimb)
-							{
-								if (nbot < asmin) asmin = nbot;
-								if (nbot > asmax) asmax = nbot;
-							}
-							
-						}
-					}
-				}
-				
-				// The current span is close to a ledge if the drop to any
-				// neighbour span is less than the walkableClimb.
-				if (minh < -walkableClimb)
+				if ((top - bot) <= walkableHeight)
 					s->data.area = RC_NULL_AREA;
-					
-				// If the difference between all neighbours is too large,
-				// we are at steep slope, mark the span as ledge.
-				if ((asmax - asmin) > walkableClimb)
-				{
-					s->data.area = RC_NULL_AREA;
-				}
 			}
 		}
 	}
 	
-	ctx->stopTimer(RC_TIMER_FILTER_BORDER);
-}	
+	ctx->stopTimer(RC_TIMER_FILTER_WALKABLE);
+}
 ```
+
+### 3、分割可走面为简单多边形
+
+首先是创建紧缩开放高度域(rcCompactHeightfield)。具体过程是：先遍历每个可行走的区间，它与上方的另一个区间之间的部分就是一个开放区间；得到所有开放空间后，再计算每个开放区间与相邻的4个区间之间的连通关系，这里是基于walkableHeight和walkableClimb判断是否合法，计算出的连通关系以编码的形式存于rcCompactSpan的con属性中。这一步结束后会完成对rcCompactHeightfield中spans、cells和areas数组的赋值。
+![这里写图片描述](Spline.assets/70-16524313963619.jpeg)
+
+其次基于walkableRadius来裁剪可行走区域。这里用一个dist数组去存每个rcCompactSpan与可行走区域边缘的最近距离，小于walkableRadius的将chf.areas[i]标记为不可行走。计算过程中用上了前面计算出的连通关系con。
+
+最后是执行区域划分算法。可选算法分三种，这里只研究了第一种：分水岭算法。大意就是从地势的最低点开始灌水，水漫过的区间若与原区域相邻则认为是同一区域，否则认为是一个新的区域。分水岭算法通常用于图形处理领域，基于图像的灰度值来分割图像。这里唯一的不同点是用距离域来取代灰度值。距离域是指每个区间与可行走区域边缘的最近距离。距离域越大，等同于地势越低。先算出每个区间的距离域。
+![这里写图片描述](Spline.assets/70-165243167066111.jpeg)
+
+再执行分水岭算法，算出的区域id保存在rcCompactSpan.reg中。
+
+![这里写图片描述](Spline.assets/70-165243168968713.gif)
+
+### 4、跟踪并简化区域轮廓
+
+从开放高度域结构迁移到轮廓结构时，最大的概念上的改变是从关注区间(span)的表面改为关注区间的边界(edge)。
+
+对于轮廓来说，我们关心的是区间的边界。有两种类型的边界：区域(region)和内部(internal)。同样作为区间边界，区域边界隔开了不同区域，而内部边界隔开的是同一区域。
+
+下面几个例子为了看得方便，简化成了2D模型。我们稍后会回到3D模型。
+
+![这里写图片描述](Spline.assets/70-165243282087615.gif)
+
+在这一步中我们想要将边界分成区域边界和内部边界两类。这个信息很容易得到：我们遍历所有的区间，对于每个区间我们检查它所有的邻接区间(axis-neighbours)，如果这个领接区间与它不在同一区域类，那么把边界标记为区域边界。
+
+![这里写图片描述](Spline.assets/70-165243283436117.gif)
+
+
+
+一旦我们知道哪个区间边界是区域边界后，我们就能够沿着边界构建轮廓了。我们再一次遍历所有区间，若它拥有一条区域边界，则：
+
+从面向已知的区域边界开始。将它添加到轮廓中。
+
+![这里写图片描述](Spline.assets/70-165243300967619.gif)
+
+旋转90度，继续添加区域边界到轮廓中，直到我们找到一条内部边界。前进一步到邻接区间中。
+
+![这里写图片描述](Spline.assets/70-165243302081221.gif)
+
+再逆时针方向旋转90度，重复执行前面的步骤。反复执行，直到我们回到初始的区间，面对初始的方向。
+
+![这里写图片描述](Spline.assets/70-165243303545523.gif)
+
+从边界到顶点
+
+如果我们想回到向量空间的话，我们需要的是顶点，而非边界。顶点的(x, z)值很容易确定。对于每条边界，我们取它的顺时针方向的区间的顶角的(x, z)值（从区间内部看）。
+
+![这里写图片描述](Spline.assets/70-165243304474825.gif)
+
+
+
+求顶点y值的过程有一些技巧。在这里我们回到3D模型中。在下面的例子中，应该选取哪个顶点呢？
+
+![这里写图片描述](Spline.assets/70-165243306583927.gif)
+
+所有的边界顶点有最多4个可能的y值。应选取最高的y值，理由有二：它保证了最终的顶点(x, y, z)在源网格表面之上。再者，它提供了一种通用的选择机制来确保使用这个顶点的所有轮廓将使用同样的高度。
+
+![这里写图片描述](Spline.assets/70-165243310061931.gif)
+
+#### 简化轮廓
+
+到这一步，我们为所有的区域生成了轮廓。轮廓是由从区间角继承来的顶点构造。下面是一个宏观的视角。
+
+注意有两种类型的轮廓部分。一种是两个相邻区域的入口，另一种则是与“空地”(empty space)相邻。在代码文档中，“空地”被称作“无效区域”(null region)。我也将在这里使用同样的术语。
+
+![这里写图片描述](Spline.assets/70-165243313587933.jpeg)
+
+那么真的需要这么多顶点吗？即使在直线轮廓上，每个区间都有构造边界的顶点。显然答案是不需要。唯一必需的顶点是在发生区域连接改变的地方，例如：区域入口的边界上。
+
+![这里写图片描述](Spline.assets/70-165243315124935.jpeg)
+
+简化区域-区域入口是件容易的事情。我们先将所有顶点丢弃，只保留必需的(mandatory)顶点。
+
+![这里写图片描述](Spline.assets/70-165243316083837.jpeg)
+
+对于到无效区域的连接要稍微复杂一些。这里使用了两个算法。
+
+第一个是由MatchNullRegionEdges实现的Douglas-Peucker算法。它使用edgeMaxDeviation参数来决定将哪些顶点丢弃以获得简化的线段。它起始于必需的顶点，然后将顶点加回，并确保没有一个起始点与简化边界之间的距离大于edgeMaxDeviation。
+
+一步步讲解：开始时是最简单的可能边界。
+
+![这里写图片描述](Spline.assets/70-165243317442339.png)
+
+从简化边界找到最远的点。若它超过了edgeMaxDeviation，则将其加回到轮廓中。
+
+![这里写图片描述](Spline.assets/70-165243319880741.png)
+
+重复这个过程，直到再也没有一个顶点与简化边界的距离超过允许值。
+
+![这里写图片描述](Spline.assets/70-165243321261943.png)
+
+简化轮廓的一个简单例子：
+
+![这里写图片描述](Spline.assets/70-165243322676545.jpeg)
+
+正如之前提到的，另一个算法用于连接到无效区域的边界。第一个算法能够产生长线段，它们会在后面的网格生成过程中用于计算长且薄的三角形。第二个算法由NullRegionMaxEdge实现，它使用maxEdgeLength参数来重新插入顶点，并确保没有一条线段超过最大长度。实现方法是检测到长的边界，将其切成两半。重复这个过程直到再也没有超长的边界。
+
+作为一个对最终网格影响的例子，在处理前：
+
+![这里写图片描述](Spline.assets/70-165243324152347.jpeg)
+
+在处理后：
+
+![这里写图片描述](Spline.assets/70-165243325327749.jpeg)
+
+### 5、通过轮廓创建多边形网格（Mesh寻找区域轮廓)
+
+这一阶段的主要工作如下：
+
+轮廓(contour)的顶点位于体素空间中，这就意味着它们的顶点是整数格式，且代表着离高度域原点的距离。因此轮廓的顶点数据要被转换成源几何体(source geometry)的向量空间坐标。
+每个轮廓与其他轮廓完全独立。在这一阶段中，我们将重复的数据合并，并将所有数据汇总到一个网格中。
+轮廓只保证可以代表简单多边形，即同时包括凸多边形(convex polygon)和凹多边形(concave polygon)。而后者对于导航网格是没有作用的。因此我们将根据实际需求将轮廓分割成凸多边形。
+我们收集多边形之间邻接边的信息（多边形邻接信息）。
+坐标转换和顶点数据合并是相对简单的过程。因此我们不再赘述。如果你对这些算法感兴趣，可以去查阅有完整文档的源代码。我们将重点放在凸多边形的分割上。对每个轮廓执行如下步骤：
+
+三角化每个轮廓。
+将三角形合并成最大可能的凸多边形。
+在生成邻接连通信息之后，我们结束这一阶段。
+
+#### 三角化
+
+三角化的实现过程是：遍历轮廓的所有边，对于每组三个顶点，判断是否能形成一个有效的内部三角形。对于所有潜在的候选者，选取形成最短新边的那一个。新的边被称作是“分割边”，或者简称“分割”(partition)。对剩余顶点继续这个过程，直至三角化完成。
+
+为了提升性能，三角化在轮廓的xz平面投影下进行。
+
+分步骤阐述：找到可能的分割方案。
+
+![这里写图片描述](Spline.assets/70-165243339940051.png)
+
+选取最短的分割并形成三角形。除去无效的分割，生成新的可能的分割。
+
+![这里写图片描述](Spline.assets/70-165243341072253.png)
+
+继续分割：
+
+![这里写图片描述](Spline.assets/70-165243343117555.png)
+
+……直到三角化完成。
+
+![这里写图片描述](Spline.assets/70-165243344061057.png)
+
+#### 检测合法的分割
+两个算法被用来判断一组三个顶点是否可形成有效的内部三角形。第一个执行速度快，而且能很快剔除那些完全位于多边形以外的分割。如果分割位于多边形内部，那么另一个更昂贵的算法被用来确保它不与任何现存的多边形边界相交。
+
+内部角算法
+
+这个算法有一点难描述。因此这里举了一些例子。首先是一个有效的分割。对于顶点A、B、C而言，AB是一种可能的划分：
+
+![这里写图片描述](Spline.assets/70-165243345768159.png)
+
+从顶点A出发顺着相邻边界发出两条射线。如果分割的终点（顶点B）位于内部角中，那么这就是一个可能的有效分割。
+
+![这里写图片描述](Spline.assets/70-165243346946161.png)
+
+第二个例子是同样的场景、不同的顶点。因为分割的终点（顶点B）位于内部角之外，所以它不可能是有效的分割。
+
+![这里写图片描述](Spline.assets/70-165243348051863.png)
+
+边相交算法
+
+这个算法容易理解多了。它仅仅是遍历多边形中所有的边，并检查可能的分割是否与它们中的任何一个相交。如果有，那么就不是一个有效分割。
+
+只有两个算法都通过，才能认为分割是有效的。
+
+#### 合并成凸多边形
+合并只能发生在由同一轮廓生成的多个多边形之间。不要尝试去合并两个相邻轮廓里的多边形。
+
+请注意我已经切换到通用的形式“多边形”，而非三角形。最初的合并针对的都是三角形，但随着合并过程的深入，非三角形的多边形也可能被合并。
+
+这个过程如下：
+
+-   找到所有能够被合并的多边形。
+-   从这个列表中，选取两个有最长公共边的多边形合并。
+-   重复直至再没有可合并的多边形。
+
+两个多边形想要合并，需要满足以下所有条件：
+
+-   多边形共享一条边。
+-   生成的多边形仍然是凸多边形。
+-   生成的多边形边数不多于参数maxVertsPerPoly
+
+检查共享边和计算合并边数量都很容易。判断合并后的多边形是否为凸多边形则更复杂一点。这个判断过程的关键是共享的顶点。在合并后，两者都需要检查一下形状。如果都能形成内部锐角1，那么合并后的多边形仍然会是凸多边形。我们对每个共享的顶点做如下操作：
+
+1.   由共享顶点相邻前后的两个顶点构造一条有向的参考线(directed reference line)。
+2.   如果共享的顶点位于它的参考线左侧，那么就形成了一个锐角。
+
+最好看图说话。第一个例子展示了一个有效的合并。
+
+![这里写图片描述](Spline.assets/70-165243350597965.png)
+
+如果共享的顶点被标记为A，那么参考线则定为从顶点A-1到顶点A+1。顶点A处在参考线的左侧吗？
+
+![这里写图片描述](Spline.assets/70-165243360267867.png)
+
+现在来看第二个共享的顶点。它是在参考线左侧吗？
+
+![这里写图片描述](Spline.assets/70-165243361275069.png)
+
+在这下一个例子中，合并是无效的，因为合并后其中一个共享顶点形成的内部角是钝角。
+
+![这里写图片描述](Spline.assets/70-165243363338971.png)
+
+如果你对于用来检查点相对于有向线位置的算法不熟悉，那么可参见Soft Surfer算法。核心算法由`PolyMeshFieldBuilder`类中的`getSignedAreaX2()`函数来实现。
+
+这个阶段的最后一步是遍历整个网格中的所有多边形，并生成连接信息。
+
+当算法被优化后，从宏观上来讲，只需简单遍历所有的多边形边，并寻找与其有公共顶点的其他多边形。
+
+我们最终回到了向量空间，并得到了一个由凸多边形构成的网格。
+
+![这里写图片描述](Spline.assets/70-165243367531073.jpeg)
+
+
+
+### 6、创建细节网格（允许访问每个多边形的近似高度）
+
+#### 为什么需要这一步
+如果源网格的可行走表面被投影到xz平面上，且被前一个步骤中生成的多边形网格覆盖，那么这两者能很好地匹配。但是在3维空间中，多边形网格可能不会与源网格的高度轮廓恰好一致。这一阶段增加了高度细节，使得细节网格能够在三维上匹配源网格的表面。为了实现这个目标，我们遍历所有的多边形，只要多边形过度偏离源网格，就在多边形的边和内部插入顶点。
+
+在下面的例子中，靠近楼梯的多边形网格在xz平面上匹配，但是在y轴上偏离了很多。
+
+![这里写图片描述](Spline.assets/70-165243371326777.gif)
+
+当高度细节加入后，在y轴上匹配得更好了。
+
+![这里写图片描述](Spline.assets/70-165243372524179.gif)
+
+>   从技术上来说，这一步对于寻路不是必需的。我们真正所需的只是一个凸多边形网格，它用来生成寻路算法相关的图——上一阶段中创建的多边形网格已经提供了所有必要的数据。某些场合尤其如此——例如使用物理或者射线将寻路代理放置在源网格的表面上。事实上，Recast Navigation的Detour库只使用了多边形网格做寻路。当前步骤中生成的高度细节是可选的，若包括进去，则只是用于优化各种Detour函数计算出的顶点位置。
+>
+>   同时需要注意的是，这个过程也只是生成对原始网格表面的一个更好估算。体素化决定了无法得到完全精确的位置。除此以外，考虑到性能和内存的影响，高度细节过多往往会比过少更糟糕。
+
+#### 第一步：高度补丁（height patch）
+
+你这样就以为无需体素空间和高度域了？不完全是这样。为了加入高度细节，我们需要能够确定多边形的表面是否与覆盖它的开放高度域区间离得足够远。高度补丁就是用于这个目的。它包含与一个多边形相交的每个开放高度域格子位置的期望高度。基本上，它是开放高度域某一部分的简单裁剪，带有下列特征：
+
+-   它只包含单个多边形的AABB包围盒的高度信息。
+-   它只包含每个格子位置的底部高度（无区间）。
+-   它只对每个格子位置有单个高度（无覆盖）。
+
+![这里写图片描述](Spline.assets/70-165243378364683.gif)
+
+总览
+当前阶段的主要步骤如下：对于每个多边形来说，
+
+1.   对多边形的外边采样。若这条边偏离高度补丁大于contourMaxDeviation值，则添加顶点。
+2.   对多边形执行德劳内三角化（Delaunay triangulation）。
+3.   对多边形的内部表面采样。若表面偏离高度补丁大于contourMaxDeviation值，则添加顶点。对于任何新顶点更新三角化。
+
+####  给多边形的边添加细节
+
+这一步更好地匹配数据在高度补丁里的多边形的边的高度。它是两个采样过程的第一步，第二步是处理多边形表面。
+
+>   接下来从2D角度看。在下面一组图中，我们从沿y轴上升的那一侧来看网格。
+
+对于多边形的每条边：基于`contourSampleDistance`的值将边切割成线段。例如：如果边长10个单位，采样距离是2个单位，那么将边切割成5条等长的线段。这里的“采样顶点”并非全部会被用到，它们只是可能的顶点。
+
+![这里写图片描述](Spline.assets/70-165243388876085.png)
+
+使用高度补丁数据，将每个采样顶点的高度（y值）快照到高度域中。
+
+![这里写图片描述](Spline.assets/70-165243390459087.png)
+
+检查采样顶点到原始边之间的距离。若超过最大偏离，则插入离原始边最远的采样顶点。
+
+![这里写图片描述](Spline.assets/70-165243391979889.png)
+
+重复距离检查，直到多边形新的部分已完成。
+
+![这里写图片描述](Spline.assets/70-165243393394291.png)
+
+#### 三角化
+
+网上有大量关于德劳内三角化的信息，因此我们不再赘述，唯一想说的就是：在给边添加细节后，它被用来对多边形做三角化。到此为止原始多边形不复存在。所有的操作都是针对三角形网格。
+
+这是多个可能的三角化的第一步。从这一步开始，当任意新的顶点加入到网格中时，三角化将会发生。
+
+#### 给内部多边形表面添加细节
+
+到此为止我们从单个多边形得到了较小的三角形网格。（或者，如果原始的多边形就是三角形，而且没有新的顶点在边的细节这一步加入，那么我们仍然拥有一个三角形。）所有的顶点仍然在网格的边上。在这一步中，我们检查网格的内部表面，看它是否与高度补丁中的数据偏离太多。
+
+![这里写图片描述](Spline.assets/70-165243398379493.png)
+
+>   下面一组图仍然是2D的。但是我们切换到xz平面的俯视视角。
+
+添加高度细节到三角形网格的内部表面与添加到边上类似。采样顶点的格子沿着网格的AABB包围盒所在的xz平面被构建。间距基于`contourSampleDistance`的值。采样顶点的y轴的值被快照存储到高度补丁里的数据中。
+
+网格外部的采样顶点被丢弃掉。
+
+![这里写图片描述](Spline.assets/70-165243400068695.png)
+
+在剩余的采样顶点中，找到离三角形网格的表面最远的那个。如果它比`contourMaxDeviation`的值更远，那么就将它加入网格中，并重新三角化。
+
+![这里写图片描述](Spline.assets/70-165243402343297.png)
+
+重复这个过程，直到再没有采样顶点超过`contourMaxDeviation`的值。
+
+![这里写图片描述](Spline.assets/70-165243403421599.png)
+
+#### 结尾
+
+这一步中的其他工作属于事务性工作。由独立多边形创建的细节三角形网格被合并成单个网格，并被加载到`TriangleMesh`的实例中。整个过程就此完结。我们得到了最终的导航网格。
+
+![这里写图片描述](Spline.assets/70-1652434048759101.jpeg)
+
+
+
+
 
 
 
